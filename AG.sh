@@ -1,5 +1,5 @@
 #!/bin/bash
-# AG Industrial Node Manager (Titan-Style Fork)
+# AG Industrial Node Manager (Titan-Style)
 # GitHub: https://github.com/your-repo
 
 # Конфигурация
@@ -18,7 +18,7 @@ declare -A USED_PORTS=()
 show_menu() {
     clear
     echo -ne "${ORANGE}"
-    curl -sSLf "$LOGO_URL" 2>/dev/null || echo "=== AG INDUSTRIAL NODES v3 ==="
+    curl -sSLf "$LOGO_URL" 2>/dev/null || echo "=== AG INDUSTRIAL NODES ==="
     echo -e "\n1) Установить компоненты\n2) Создать ноды\n3) Проверить статус\n4) Показать логи\n5) Перезапустить\n6) Очистка\n7) Выход"
     echo -ne "${NC}"
 }
@@ -41,27 +41,14 @@ validate_commands() {
     [[ "$3" =~ "./launcher --user_did=did:embarky:.*--device_id=.*--device_name=" ]]
 }
 
-wait_for_pin() {
-    local container_name=$1
-    local timeout=30
-    for ((i=0; i<timeout; i++)); do
-        if docker logs "$container_name" 2>&1 | grep -qE "PIN: [0-9]{4}|ready for work"; then
-            return 0
-        fi
-        sleep 1
-    done
-    return 1
-}
-
-create_node() {
+deploy_node() {
     local node_num=$1
     IFS=',' read -r cpu ram ssd <<< "$(generate_realistic_profile)"
     local port=$(shuf -i 30000-40000 -n1)
     local node_ip="${BASE_IP%.*}.$(( ${BASE_IP##*.} + node_num ))"
     local mac=$(generate_fake_mac)
     local container_name="ag_node_$node_num"
-
-    # Ввод команд
+    
     while true; do
         echo -e "${ORANGE}=== НОДА $node_num ===${NC}"
         read -p "1/3 Введите команду загрузки (curl): " cmd1
@@ -71,17 +58,15 @@ create_node() {
         if validate_commands "$cmd1" "$cmd2" "$cmd3"; then
             device_id=$(grep -oP "device_id=\K[^ ]+" <<< "$cmd3")
             [[ -z "${USED_IDS[$device_id]}" ]] && break
-            echo -e "${RED}Device ID уже используется!${NC}"
+            echo -e "${RED}Ошибка: Device ID уже используется!${NC}"
         else
             echo -e "${RED}Неверный формат! Пример:"
-            echo -e "curl -L .../launcher -o launcher && curl -L .../worker -o worker"
-            echo -e "./launcher --user_did=... --device_id=... --device_name=...${NC}"
+            echo -e "CMD1: curl -L .../launcher -o launcher && curl -L .../worker -o worker"
+            echo -e "CMD3: ./launcher --user_did=... --device_id=... --device_name=...${NC}"
         fi
     done
 
-    # Запуск ноды
     {
-        echo -e "${GREEN}[*] Инициализация ноды $node_num...${NC}"
         mkdir -p "/ag/$node_num" && cd "/ag/$node_num"
         eval "$cmd1" || { echo -e "${RED}Ошибка загрузки!${NC}"; return 1; }
         eval "$cmd2" || { echo -e "${RED}Ошибка прав доступа!${NC}"; return 1; }
@@ -90,21 +75,21 @@ create_node() {
             --name "$container_name" \
             --restart unless-stopped \
             --cpus "$cpu" \
-            --memory "${ram}G" \
-            --storage-opt "size=${ssd}G" \
+            --memory "${ram}g" \
+            --storage-opt "size=${ssd}g" \
             --mac-address "$mac" \
             -p "$port:$port" \
             -v "$PWD:/data" \
             alpine/node:18 \
             sh -c "$cmd3 --http_port=$port" || { echo -e "${RED}Ошибка запуска!${NC}"; return 1; }
 
-        if wait_for_pin "$container_name"; then
+        if docker logs "$container_name" 2>&1 | grep -qE "PIN: [0-9]{4}|ready for work"; then
             USED_IDS["$device_id"]=1
             echo "$node_num|$device_id|$mac|$port|$node_ip|$cpu|$ram|$ssd" >> "$CONFIG_FILE"
             echo -e "${GREEN}[✓] Нода $node_num | ${cpu} ядер | ${ram}GB RAM | ${ssd}GB SSD${NC}"
             echo -e "${ORANGE}PIN: $(docker logs $container_name | grep -oE 'PIN: [0-9]{4}')${NC}"
         else
-            echo -e "${RED}[✗] Таймаут запуска ноды $node_num!${NC}"
+            echo -e "${RED}[✗] Ошибка инициализации ноды $node_num!${NC}"
             docker rm -f "$container_name" >/dev/null
             return 1
         fi
@@ -121,7 +106,7 @@ setup_nodes() {
     done
 
     for ((i=1; i<=count; i++)); do
-        create_node $i
+        deploy_node $i
     done
 }
 
@@ -139,9 +124,6 @@ check_status() {
             "#$num" "$cpu" "${ram}GB" "${ssd}GB" "$mac" "$ip" "$status"
     done < "$CONFIG_FILE"
     
-    echo -e "\n${ORANGE}Использование ресурсов:${NC}"
-    docker stats --no-stream --format "table {{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}\t{{.NetIO}}"
-    
     read -p $'\nНажмите Enter...' -n1 -s
 }
 
@@ -155,11 +137,10 @@ show_logs() {
 cleanup() {
     echo -e "${RED}\n[!] ПОЛНАЯ ОЧИСТКА [!]${NC}"
     
-    # Удаление Docker-ресурсов
+    # Удаление контейнеров
     docker ps -aq --filter "name=ag_node_" | xargs -r docker rm -f
-    docker volume prune -f
     
-    # Сброс сети
+    # Очистка сети
     for i in {1..50}; do
         ip="${BASE_IP%.*}.$(( ${BASE_IP##*.} + i ))"
         sudo ip addr del "$ip/24" dev "$NETWORK_INTERFACE" 2>/dev/null
@@ -190,7 +171,6 @@ install_dependencies() {
     sleep 1
 }
 
-# Системный сервис
 [ ! -f /etc/systemd/system/ag-node.service ] && sudo tee /etc/systemd/system/ag-node.service > /dev/null <<EOF
 [Unit]
 Description=AG Node Service
@@ -204,11 +184,10 @@ Restart=always
 WantedBy=multi-user.target
 EOF
 
-# Главный цикл
 case $1 in
     --daemon)
         [ -f "$CONFIG_FILE" ] && while IFS='|' read -r num _ _ _ _ _ _ _; do
-            create_node "$num"
+            deploy_node "$num"
         done < "$CONFIG_FILE"
         ;;
     *)
